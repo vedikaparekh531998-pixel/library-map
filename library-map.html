@@ -1,0 +1,232 @@
+<style>
+  #lm-root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #lm-toolbar { display:flex; align-items:center; gap:12px; padding: 0 0 12px; flex-wrap:wrap; }
+  #lm-status { font-size: 13px; color: #666; flex:1; min-width:160px; }
+  #lm-refresh { display:flex; align-items:center; gap:6px; font-size:13px; padding:7px 14px; border-radius: 8px;
+    border:1px solid #ccc; background:#fff; color:#222; cursor:pointer; }
+  #lm-refresh:hover { border-color: #7F77DD; color: #534AB7; }
+  #lm-refresh:disabled { opacity:.5; cursor:default; }
+  #lm-canvas-wrap { position:relative; width:100%; height:640px; border:1px solid #e2e2e2; border-radius:12px; overflow:hidden; background:#fafafa; }
+  #lm-svg { width:100%; height:100%; display:block; }
+  #lm-tooltip { position:absolute; max-width:280px; padding:10px 12px; background:#fff; border:1px solid #ccc;
+    border-radius:10px; font-size:13px; line-height:1.5; color:#222; pointer-events:none; opacity:0; transition:opacity .12s; z-index:5; }
+  #lm-tooltip .lm-tt-themes { font-size:11px; color:#666; margin-top:6px; }
+  #lm-tooltip .lm-tt-hint { font-size:11px; color:#534AB7; margin-top:6px; }
+  .lm-node circle { cursor:pointer; }
+  .lm-node text { pointer-events:none; user-select:none; }
+  #lm-empty { display:flex; align-items:center; justify-content:center; height:100%; color:#666; font-size:14px; text-align:center; padding:0 40px; }
+</style>
+
+<div id="lm-root">
+  <div id="lm-toolbar">
+    <div id="lm-status">Loading…</div>
+    <button id="lm-refresh">↻ Refresh from sheet</button>
+  </div>
+  <div id="lm-canvas-wrap">
+    <div id="lm-empty">No data yet.</div>
+    <svg id="lm-svg"></svg>
+    <div id="lm-tooltip"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script>
+(function(){
+  // ---- CONFIGURE THIS ----
+  const SHEET_ID = "1Ux4lf9nFmPzotJYhv2QSL9eUPz-LnBb49zLrGGLPiJg";
+  const TAB_NAME = "Library";
+  // -------------------------
+
+  const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(TAB_NAME)}`;
+
+  const statusEl = document.getElementById('lm-status');
+  const refreshBtn = document.getElementById('lm-refresh');
+  const emptyEl = document.getElementById('lm-empty');
+  const svg = d3.select('#lm-svg');
+  const tooltip = document.getElementById('lm-tooltip');
+  const wrap = document.getElementById('lm-canvas-wrap');
+
+  let simulation = null;
+
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], field = '', inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i], next = text[i+1];
+      if (inQuotes) {
+        if (c === '"' && next === '"') { field += '"'; i++; }
+        else if (c === '"') { inQuotes = false; }
+        else { field += c; }
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ',') { row.push(field); field = ''; }
+        else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+        else if (c === '\r') { /* skip */ }
+        else { field += c; }
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows;
+  }
+
+  async function fetchVideos() {
+    const res = await fetch(CSV_URL);
+    if (!res.ok) throw new Error('Could not reach the sheet (check sharing is "anyone with link can view")');
+    const text = await res.text();
+    const rows = parseCSV(text);
+    const header = rows[0].map(h => h.trim().toLowerCase());
+    const linkIdx = header.indexOf('link');
+    const transcriptIdx = header.indexOf('transcript');
+    const responseIdx = header.indexOf('response layer');
+    const themesIdx = header.indexOf('themes');
+
+    const videos = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || r.length < 2) continue;
+      const link = (r[linkIdx] || '').trim();
+      const transcript = (r[transcriptIdx] || '').trim();
+      if (!link || !transcript) continue;
+      const themes = (r[themesIdx] || '').split(',').map(s => s.trim()).filter(Boolean);
+      const response = (r[responseIdx] || '').trim();
+      videos.push({ link, themes, response });
+    }
+    return videos;
+  }
+
+  function buildGraph(vids) {
+    const themeCount = {};
+    vids.forEach(v => v.themes.forEach(t => { themeCount[t] = (themeCount[t]||0)+1; }));
+    const themeNames = Object.keys(themeCount);
+
+    const coOccur = {};
+    vids.forEach(v => {
+      const ts = v.themes;
+      for (let i=0;i<ts.length;i++) for (let j=i+1;j<ts.length;j++){
+        const key = ts[i] < ts[j] ? ts[i]+'|||'+ts[j] : ts[j]+'|||'+ts[i];
+        coOccur[key] = (coOccur[key]||0)+1;
+      }
+    });
+
+    const nodes = [{ id: '__center__', type: 'center', label: 'Library', r: 46 }];
+    themeNames.forEach(t => nodes.push({ id: 'theme::'+t, type: 'theme', label: t, r: 20 + Math.min(38, Math.sqrt(themeCount[t])*9) }));
+    vids.forEach((v, i) => nodes.push({ id: 'video::'+i, type: 'video', label: '', r: 6, link: v.link, response: v.response, themes: v.themes }));
+
+    const links = [];
+    themeNames.forEach(t => links.push({ source: '__center__', target: 'theme::'+t, kind:'spoke' }));
+    Object.entries(coOccur).forEach(([key, w]) => {
+      const [a,b] = key.split('|||');
+      links.push({ source: 'theme::'+a, target: 'theme::'+b, kind:'corr', weight: w });
+    });
+    vids.forEach((v, i) => v.themes.forEach(t => {
+      links.push({ source: 'video::'+i, target: 'theme::'+t, kind:'membership' });
+    }));
+
+    return { nodes, links };
+  }
+
+  function render(vids) {
+    if (!vids.length) { emptyEl.style.display = 'flex'; svg.selectAll('*').remove(); return; }
+    emptyEl.style.display = 'none';
+
+    const { nodes, links } = buildGraph(vids);
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    svg.attr('viewBox', [0,0,w,h]);
+    svg.selectAll('*').remove();
+
+    if (simulation) simulation.stop();
+    simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id(d=>d.id).distance(l => {
+        if (l.kind === 'spoke') return 170;
+        if (l.kind === 'corr') return 260 / (1 + Math.min(l.weight, 8));
+        return 26;
+      }).strength(l => l.kind === 'membership' ? 0.9 : (l.kind === 'corr' ? 0.5 : 0.2)))
+      .force('charge', d3.forceManyBody().strength(d => d.type === 'center' ? -900 : d.type === 'theme' ? -260 : -12))
+      .force('collide', d3.forceCollide().radius(d => d.r + (d.type==='video' ? 3 : 8)))
+      .force('center', d3.forceCenter(w/2, h/2));
+
+    const linkSel = svg.append('g').selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke', l => l.kind === 'corr' ? '#999' : '#ccc')
+      .attr('stroke-width', l => l.kind === 'membership' ? 0.6 : 1)
+      .attr('opacity', l => l.kind === 'corr' ? 0.5 : 0.35);
+
+    const colorFor = d => {
+      if (d.type === 'center') return { fill: '#7F77DD', stroke:'#3C3489', text:'#fff' };
+      if (d.type === 'theme') return { fill: '#5DCAA5', stroke:'#0F6E56', text:'#04342C' };
+      return { fill: '#B4B2A9', stroke:'#5F5E5A', text:'#2C2C2A' };
+    };
+
+    const nodeSel = svg.append('g').selectAll('g')
+      .data(nodes)
+      .join('g')
+      .attr('class','lm-node')
+      .call(d3.drag()
+        .on('start', (event,d)=>{ if(!event.active) simulation.alphaTarget(0.25).restart(); d.fx=d.x; d.fy=d.y; })
+        .on('drag', (event,d)=>{ d.fx=event.x; d.fy=event.y; })
+        .on('end', (event,d)=>{ if(!event.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+    nodeSel.append('circle')
+      .attr('r', d=>d.r)
+      .attr('fill', d=>colorFor(d).fill)
+      .attr('stroke', d=>colorFor(d).stroke)
+      .attr('stroke-width', d => d.type==='video' ? 0.6 : 1);
+
+    nodeSel.filter(d=>d.type!=='video').append('text')
+      .attr('text-anchor','middle')
+      .attr('dominant-baseline','central')
+      .attr('font-size', d=>d.type==='center'?15:12)
+      .attr('font-weight', 500)
+      .attr('fill', d=>colorFor(d).text)
+      .each(function(d){
+        const words = d.label.split(' ');
+        const lines = [];
+        let cur = '';
+        words.forEach(w2=>{
+          if ((cur+' '+w2).trim().length * (d.type==='center'?8:6.5) > d.r*1.7 && cur) { lines.push(cur); cur = w2; }
+          else cur = (cur+' '+w2).trim();
+        });
+        lines.push(cur);
+        const el = d3.select(this);
+        lines.forEach((ln,i)=> el.append('tspan').attr('x',0).attr('dy', i===0 ? `${-(lines.length-1)*0.6}em` : '1.2em').text(ln));
+      });
+
+    nodeSel.filter(d=>d.type==='video')
+      .on('mousemove', (event,d)=>{
+        tooltip.style.opacity = 1;
+        const rect = wrap.getBoundingClientRect();
+        tooltip.style.left = (event.clientX - rect.left + 14) + 'px';
+        tooltip.style.top = (event.clientY - rect.top + 14) + 'px';
+        tooltip.innerHTML = (d.response ? d.response : '<em>No response layer yet</em>') +
+          '<div class="lm-tt-themes">' + d.themes.join(' · ') + '</div>' +
+          '<div class="lm-tt-hint">Click to open transcript link</div>';
+      })
+      .on('mouseleave', ()=>{ tooltip.style.opacity = 0; })
+      .on('click', (event,d)=>{ if (d.link) window.open(d.link,'_blank'); });
+
+    simulation.on('tick', ()=>{
+      linkSel
+        .attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
+        .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+      nodeSel.attr('transform', d=>`translate(${d.x},${d.y})`);
+    });
+  }
+
+  async function refresh() {
+    refreshBtn.disabled = true;
+    statusEl.textContent = 'Reading sheet…';
+    try {
+      const videos = await fetchVideos();
+      render(videos);
+      statusEl.textContent = `${videos.length} videos · updated ${new Date().toLocaleTimeString()}`;
+    } catch (e) {
+      statusEl.textContent = e.message || 'Something went wrong reading the sheet.';
+    }
+    refreshBtn.disabled = false;
+  }
+
+  refreshBtn.addEventListener('click', refresh);
+  refresh();
+})();
+</script>
